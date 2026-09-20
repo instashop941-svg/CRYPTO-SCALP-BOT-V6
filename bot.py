@@ -1,332 +1,99 @@
-"""
-SCALP V6 — MEXC Futures Signal Bot
-Separate V6 bot. Does NOT modify ETH V4 FIXED.
-
-Workflow:
-1H  -> direction + major zones
-15m -> structure + liquidity
-10m -> scenario confirmation
-5m  -> entry trigger
-
-Core setup:
-WAIT -> LIQUIDITY SWEEP -> CHoCH/BOS -> IMB/FVG -> RETEST -> 5m CONFIRMATION -> ENTRY
-
-Educational/trading automation template. Test on paper/demo before live use.
-"""
-
-import os
-import time
-import logging
-from dataclasses import dataclass
-from typing import Optional, List, Dict
-
-import ccxt
-import pandas as pd
-import numpy as np
-import requests
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | V6 | %(levelname)s | %(message)s"
-)
-
-SYMBOLS = os.getenv(
-    "SYMBOLS",
-    "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,"
-    "HBAR/USDT:USDT,JUP/USDT:USDT,LINK/USDT:USDT,VIRTUAL/USDT:USDT"
-).split(",")
-
-TIMEFRAMES = ["1h", "15m", "10m", "5m"]
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
-LEVERAGE = int(os.getenv("LEVERAGE", "30"))
-RR = float(os.getenv("RR", "2.0"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "7"))
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-exchange = ccxt.mexc({
-    "enableRateLimit": True,
-    "options": {"defaultType": "swap"},
-})
-
-
-@dataclass
-class Setup:
-    symbol: str
-    side: str
-    score: int
-    entry_low: float
-    entry_high: float
-    sl: float
-    tp1: float
-    tp2: float
-    reason: str
-
-
-def telegram(text: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.info("Telegram disabled:\n%s", text)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+import os,time,math,logging,requests,ccxt
+logging.basicConfig(level=logging.INFO,format='%(asctime)s | V6 | %(levelname)s | %(message)s')
+SYMBOLS=os.getenv('SYMBOLS','BTC/USDT:USDT,ETH/USDT:USDT,NEAR/USDT:USDT,PYTH/USDT:USDT,ADA/USDT:USDT,ENA/USDT:USDT').split(',')
+POLL_SECONDS=int(os.getenv('POLL_SECONDS','60')); LEVERAGE=int(os.getenv('LEVERAGE','30')); RR=float(os.getenv('RR','2.0')); MIN_SCORE=int(os.getenv('MIN_SCORE','7'))
+TELEGRAM_TOKEN=os.getenv('TELEGRAM_BOT_TOKEN',''); TELEGRAM_CHAT_ID=os.getenv('TELEGRAM_CHAT_ID','')
+exchange=ccxt.mexc({'enableRateLimit':True,'options':{'defaultType':'swap'}})
+def closes(r): return [float(x[4]) for x in r]
+def highs(r): return [float(x[2]) for x in r]
+def lows(r): return [float(x[3]) for x in r]
+def opens(r): return [float(x[1]) for x in r]
+def ema(v,p):
+    if not v:return 0.0
+    k=2/(p+1); e=v[0]
+    for x in v[1:]: e=x*k+e*(1-k)
+    return e
+def atr(r,p=14):
+    if len(r)<p+2:return 0.0
+    tr=[]
+    for i in range(1,len(r)):
+        h,l,pc=float(r[i][2]),float(r[i][3]),float(r[i-1][4]); tr.append(max(h-l,abs(h-pc),abs(l-pc)))
+    return sum(tr[-p:])/p
+def fetch(s,tf): return exchange.fetch_ohlcv(s,timeframe=tf,limit=80)
+def bias(d):
+    c=closes(d)
+    if len(c)<55:return 'NEUTRAL'
+    e20,e50,last=ema(c[:-1],20),ema(c[:-1],50),c[-2]
+    if last>e20>e50:return 'LONG'
+    if last<e20<e50:return 'SHORT'
+    return 'NEUTRAL'
+def structure(d):
+    if len(d)<12:return 'RANGE'
+    c,h,l=closes(d),highs(d),lows(d); last=c[-2]; hi,lo=max(h[-8:-2]),min(l[-8:-2])
+    if last>hi:return 'BULL_BOS'
+    if last<lo:return 'BEAR_BOS'
+    hi3,lo3=max(h[-5:-2]),min(l[-5:-2])
+    if last>hi3:return 'BULL_CHOCH'
+    if last<lo3:return 'BEAR_CHOCH'
+    return 'RANGE'
+def sweep(d,side):
+    if len(d)<15:return False
+    h,l,c=highs(d),lows(d),closes(d); hi,lo=max(h[-14:-2]),min(l[-14:-2])
+    return l[-2]<lo and c[-2]>lo if side=='LONG' else h[-2]>hi and c[-2]<hi
+def fvg(d,side):
+    if len(d)<5:return False
+    h,l=highs(d),lows(d); return l[-2]>h[-4] if side=='LONG' else h[-2]<l[-4]
+def retest(d,side):
+    if len(d)<7:return False
+    o,c,h,l=opens(d),closes(d),highs(d),lows(d)
+    return l[-3]<=h[-5] and c[-3]>o[-3] if side=='LONG' else h[-3]>=l[-5] and c[-3]<o[-3]
+def trigger(d,side):
+    if len(d)<5:return False
+    o,c,h,l=opens(d),closes(d),highs(d),lows(d)
+    return c[-2]>o[-2] and c[-2]>h[-3] and l[-2]<=l[-3] if side=='LONG' else c[-2]<o[-2] and c[-2]<l[-3] and h[-2]>=h[-3]
+def signal(s):
     try:
-        requests.post(
-            url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10,
-        )
-    except Exception as e:
-        logging.warning("Telegram error: %s", e)
-
-
-def fetch(symbol: str, tf: str, limit: int = 160) -> pd.DataFrame:
-    raw = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    df = pd.DataFrame(
-        raw, columns=["ts", "open", "high", "low", "close", "volume"]
-    )
-    return df
-
-
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    h, l, c = df.high, df.low, df.close
-    tr = pd.concat(
-        [(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(n).mean()
-
-
-def ema(df: pd.DataFrame, n: int) -> pd.Series:
-    return df.close.ewm(span=n, adjust=False).mean()
-
-
-def swing_high(df: pd.DataFrame, n: int = 3) -> float:
-    x = df.high.iloc[:-2]
-    return float(x.tail(n * 4).max())
-
-
-def swing_low(df: pd.DataFrame, n: int = 3) -> float:
-    x = df.low.iloc[:-2]
-    return float(x.tail(n * 4).min())
-
-
-def detect_bias(df1h: pd.DataFrame) -> str:
-    e20 = ema(df1h, 20).iloc[-2]
-    e50 = ema(df1h, 50).iloc[-2]
-    close = df1h.close.iloc[-2]
-    if close > e20 > e50:
-        return "LONG"
-    if close < e20 < e50:
-        return "SHORT"
-    return "NEUTRAL"
-
-
-def detect_structure(df15: pd.DataFrame) -> str:
-    c = df15.iloc[-2]
-    prev = df15.iloc[-8:-2]
-    hi = prev.high.max()
-    lo = prev.low.min()
-
-    if c.close > hi:
-        return "BULL_BOS"
-    if c.close < lo:
-        return "BEAR_BOS"
-
-    # CHoCH proxy: last candle breaks the opposite side after a short pullback.
-    if c.close > prev.high.tail(3).max():
-        return "BULL_CHOCH"
-    if c.close < prev.low.tail(3).min():
-        return "BEAR_CHOCH"
-    return "RANGE"
-
-
-def liquidity_sweep(df: pd.DataFrame, side: str) -> bool:
-    """Detect sweep of recent liquidity with close back inside the range."""
-    x = df.iloc[:-2]
-    last = df.iloc[-2]
-    recent_hi = x.high.tail(12).max()
-    recent_lo = x.low.tail(12).min()
-
-    if side == "LONG":
-        return last.low < recent_lo and last.close > recent_lo
-    return last.high > recent_hi and last.close < recent_hi
-
-
-def imbalance(df: pd.DataFrame, side: str) -> bool:
-    """Simple 3-candle FVG/imbalance proxy."""
-    a, b, c = df.iloc[-4], df.iloc[-3], df.iloc[-2]
-    if side == "LONG":
-        return c.low > a.high
-    return c.high < a.low
-
-
-def retest(df10: pd.DataFrame, side: str) -> bool:
-    """Price returns to the latest 10m imbalance/impulse area."""
-    a, b, c = df10.iloc[-5], df10.iloc[-4], df10.iloc[-3]
-    if side == "LONG":
-        if c.low <= a.high and c.close > c.open:
-            return True
-    else:
-        if c.high >= a.low and c.close < c.open:
-            return True
-    return False
-
-
-def trigger_5m(df5: pd.DataFrame, side: str) -> bool:
-    """Entry trigger: rejection + direction candle."""
-    x = df5.iloc[-3:-1]
-    last = x.iloc[-1]
-    prev = x.iloc[-2]
-
-    if side == "LONG":
-        return (
-            last.close > last.open
-            and last.close > prev.high
-            and last.low <= prev.low
-        )
-    return (
-        last.close < last.open
-        and last.close < prev.low
-        and last.high >= prev.high
-    )
-
-
-def build_setup(symbol: str) -> Optional[Setup]:
-    try:
-        d1h = fetch(symbol, "1h")
-        d15 = fetch(symbol, "15m")
-        d10 = fetch(symbol, "10m")
-        d5 = fetch(symbol, "5m")
-
-        bias = detect_bias(d1h)
-        structure = detect_structure(d15)
-
-        candidates = []
-        if bias == "LONG" and structure in ("BULL_BOS", "BULL_CHOCH"):
-            candidates.append("LONG")
-        if bias == "SHORT" and structure in ("BEAR_BOS", "BEAR_CHOCH"):
-            candidates.append("SHORT")
-
-        if not candidates:
-            return None
-
-        side = candidates[0]
-        score = 2
-        reasons = [f"1H={bias}", f"15m={structure}"]
-
-        if liquidity_sweep(d15, side):
-            score += 2
-            reasons.append("15m liquidity sweep")
+        d1,d15,d10,d5=fetch(s,'1h'),fetch(s,'15m'),fetch(s,'10m'),fetch(s,'5m'); b,st=bias(d1),structure(d15)
+        if b=='LONG' and st in ('BULL_BOS','BULL_CHOCH'): side='LONG'
+        elif b=='SHORT' and st in ('BEAR_BOS','BEAR_CHOCH'): side='SHORT'
+        else:return None
+        score=4; reasons=['1H='+b,'15m='+st]
+        if not sweep(d15,side):return None
+        score+=2; reasons.append('15m liquidity sweep')
+        if not fvg(d10,side):return None
+        score+=2; reasons.append('10m imbalance/FVG')
+        if not retest(d10,side):return None
+        score+=1; reasons.append('10m retest')
+        if not trigger(d5,side):return None
+        score+=1; reasons.append('5m confirmation')
+        if score<MIN_SCORE:return None
+        price,a=closes(d5)[-2],atr(d5)
+        if not math.isfinite(a) or a<=0:return None
+        h,l=highs(d5),lows(d5)
+        if side=='LONG':
+            sl=min(l[-12:])-.25*a; risk=price-sl
+            if risk<=0:return None
+            el,eh=price-.20*a,price+.05*a; tp1,tp2=price+risk,price+risk*RR
         else:
-            return None
-
-        if imbalance(d10, side):
-            score += 2
-            reasons.append("10m imbalance/FVG")
-        else:
-            return None
-
-        if retest(d10, side):
-            score += 2
-            reasons.append("10m retest")
-        else:
-            return None
-
-        if trigger_5m(d5, side):
-            score += 2
-            reasons.append("5m confirmation")
-        else:
-            return None
-
-        if score < MIN_SCORE:
-            return None
-
-        price = float(d5.close.iloc[-2])
-        a = float(atr(d5).iloc[-2])
-        if not np.isfinite(a) or a <= 0:
-            return None
-
-        # SL beyond recent 5m liquidity/sweep with ATR buffer.
-        if side == "LONG":
-            sweep_low = float(d5.low.tail(12).min())
-            sl = sweep_low - 0.25 * a
-            risk = price - sl
-            if risk <= 0:
-                return None
-            tp1 = price + risk * 1.0
-            tp2 = price + risk * RR
-            entry_low = price - 0.20 * a
-            entry_high = price + 0.05 * a
-        else:
-            sweep_high = float(d5.high.tail(12).max())
-            sl = sweep_high + 0.25 * a
-            risk = sl - price
-            if risk <= 0:
-                return None
-            tp1 = price - risk * 1.0
-            tp2 = price - risk * RR
-            entry_low = price - 0.05 * a
-            entry_high = price + 0.20 * a
-
-        return Setup(
-            symbol=symbol,
-            side=side,
-            score=score,
-            entry_low=min(entry_low, entry_high),
-            entry_high=max(entry_low, entry_high),
-            sl=sl,
-            tp1=tp1,
-            tp2=tp2,
-            reason=" | ".join(reasons),
-        )
-
-    except Exception as e:
-        logging.warning("%s: %s", symbol, e)
-        return None
-
-
-def format_signal(s: Setup) -> str:
-    emoji = "🟢 LONG" if s.side == "LONG" else "🔴 SHORT"
-    return (
-        f"{emoji}\n"
-        f"V6 SCALP — {s.symbol}\n\n"
-        f"Score: {s.score}/10\n"
-        f"Entry: {s.entry_low:.8g} – {s.entry_high:.8g}\n"
-        f"SL: {s.sl:.8g}\n"
-        f"TP1: {s.tp1:.8g}\n"
-        f"TP2: {s.tp2:.8g}\n"
-        f"Leverage: {LEVERAGE}x\n\n"
-        f"CONFIRMATION:\n{s.reason}\n\n"
-        f"⚠️ Це сигнал алгоритму, не гарантія результату."
-    )
-
-
+            sl=max(h[-12:])+.25*a; risk=sl-price
+            if risk<=0:return None
+            el,eh=price-.05*a,price+.20*a; tp1,tp2=price-risk,price-risk*RR
+        return side,s,score,min(el,eh),max(el,eh),sl,tp1,tp2,' | '.join(reasons)
+    except Exception as e: logging.warning('%s: %s',s,e); return None
+def send(t):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:return
+    try: requests.post('https://api.telegram.org/bot'+TELEGRAM_TOKEN+'/sendMessage',json={'chat_id':TELEGRAM_CHAT_ID,'text':t},timeout=8)
+    except Exception as e:logging.warning('Telegram error: %s',e)
 def main():
-    logging.info("SCALP V6 started | symbols=%s", ",".join(SYMBOLS))
-    last_sent: Dict[str, float] = {}
-
+    logging.info('SCALP V6 LIGHT started | symbols=%s',','.join(SYMBOLS)); last={}
     while True:
-        for symbol in SYMBOLS:
-            symbol = symbol.strip()
-            if not symbol:
-                continue
-
-            setup = build_setup(symbol)
-            if setup is None:
-                continue
-
-            # Avoid duplicate alerts for the same symbol for 30 minutes.
-            now = time.time()
-            if now - last_sent.get(symbol, 0) < 1800:
-                continue
-
-            msg = format_signal(setup)
-            telegram(msg)
-            logging.info(msg)
-            last_sent[symbol] = now
-
+        for s in SYMBOLS:
+            s=s.strip()
+            if not s:continue
+            x=signal(s)
+            if not x or time.time()-last.get(s,0)<1800:continue
+            side,sym,score,el,eh,sl,tp1,tp2,why=x; icon='ð¢ LONG' if side=='LONG' else 'ð´ SHORT'
+            msg=f'{icon}\nV6 SCALP â {sym}\n\nScore: {score}/10\nEntry: {el:.8g} â {eh:.8g}\nSL: {sl:.8g}\nTP1: {tp1:.8g}\nTP2: {tp2:.8g}\nLeverage: {LEVERAGE}x\n\nCONFIRMATION:\n{why}\n\nâ ï¸ Ð¦Ðµ ÑÐ¸Ð³Ð½Ð°Ð» Ð°Ð»Ð³Ð¾ÑÐ¸ÑÐ¼Ñ, Ð½Ðµ Ð³Ð°ÑÐ°Ð½ÑÑÑ ÑÐµÐ·ÑÐ»ÑÑÐ°ÑÑ.'
+            send(msg); logging.info(msg); last[s]=time.time()
         time.sleep(POLL_SECONDS)
-
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__':main()

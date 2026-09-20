@@ -1,4 +1,2 @@
 ccxt
 requests
-pandas
-numpy
